@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VORTEX - Real-Time AI Voice Fraud Detection</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Inter:wght@300;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { 
+            background: linear-gradient(135deg, #090a0f 0%, #1c1e29 100%); 
+            color: #fff; 
+            font-family: 'Inter', sans-serif; 
+            min-height: 100vh;
+        }
+        h1, h2, h3, .brand { font-family: 'Orbitron', sans-serif; }
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 16px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+        }
+        .text-neon-blue { color: #00f0ff; text-shadow: 0 0 10px rgba(0,240,255,0.5); }
+        .text-neon-red { color: #ff003c; text-shadow: 0 0 10px rgba(255,0,60,0.5); }
+        .text-neon-green { color: #00ff66; text-shadow: 0 0 10px rgba(0,255,102,0.5); }
+        .pulse-anim { animation: pulse-shadow 2s infinite; }
+        @keyframes pulse-shadow {
+            0% { box-shadow: 0 0 0 0 rgba(0, 240, 255, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(0, 240, 255, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 240, 255, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            const [isStreaming, setIsStreaming] = useState(false);
+            const [telemetry, setTelemetry] = useState(null);
+            
+            // Active Defense States
+            const [dafEnabled, setDafEnabled] = useState(false);
+            const [ultraEnabled, setUltraEnabled] = useState(false);
+
+            // Refs for WebRTC & WebSocket
+            const wsRef = useRef(null);
+            const audioCtxRef = useRef(null);
+            const mediaStreamRef = useRef(null);
+            const processorRef = useRef(null);
+            const bufferRef = useRef([]);
+
+            // Active Probing Audio Nodes
+            const dafDelayNodeRef = useRef(null);
+            const oscillatorRef = useRef(null);
+
+            const startStream = async () => {
+                try {
+                    // Start WebSocket
+                    wsRef.current = new WebSocket("ws://localhost:8000/stream");
+                    wsRef.current.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        setTelemetry(data);
+                    };
+
+                    // Setup Audio Context at 16kHz to match backend models directly
+                    audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
+                    });
+                    mediaStreamRef.current = stream;
+
+                    const source = audioCtxRef.current.createMediaStreamSource(stream);
+                    
+                    // ScriptProcessor is deprecated but widely supported for simple PCM chunking
+                    // 16384 samples at 16kHz = ~1.02 seconds of audio buffer
+                    const processor = audioCtxRef.current.createScriptProcessor(16384, 1, 1);
+                    source.connect(processor);
+                    processor.connect(audioCtxRef.current.destination);
+                    processorRef.current = processor;
+
+                    processor.onaudioprocess = (e) => {
+                        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+                        
+                        // Extract Float32 PCM
+                        const channelData = e.inputBuffer.getChannelData(0);
+                        
+                        // Convert to Int16 PCM to send over WebSocket
+                        const int16Buffer = new Int16Array(channelData.length);
+                        for (let i = 0; i < channelData.length; i++) {
+                            // clamp
+                            let s = Math.max(-1, Math.min(1, channelData[i]));
+                            int16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        
+                        // Send binary
+                        wsRef.current.send(int16Buffer.buffer);
+                    };
+
+                    setIsStreaming(true);
+
+                } catch (err) {
+                    console.error("Failed to start stream:", err);
+                    alert("Microphone connection failed. Make sure to allow mic access.");
+                }
+            };
+
+            const stopStream = () => {
+                if (processorRef.current) {
+                    processorRef.current.disconnect();
+                }
+                if (mediaStreamRef.current) {
+                    mediaStreamRef.current.getTracks().forEach(t => t.stop());
+                }
+                if (wsRef.current) {
+                    wsRef.current.close();
+                }
+                if (audioCtxRef.current) {
+                    audioCtxRef.current.close();
+                }
+                
+                // Reset Active Defenses
+                dafDelayNodeRef.current = null;
+                oscillatorRef.current = null;
+                setDafEnabled(false);
+                setUltraEnabled(false);
+                
+                setIsStreaming(false);
+                setTelemetry(null);
+            };
+
+            // Active Probing Toggles
+            const toggleDAF = () => {
+                if (!isStreaming || !audioCtxRef.current) return;
+                
+                if (!dafEnabled) {
+                    // Enable 200ms Delay connecting source back to user speakers
+                    const source = audioCtxRef.current.createMediaStreamSource(mediaStreamRef.current);
+                    const delayNode = audioCtxRef.current.createDelay(1.0);
+                    delayNode.delayTime.value = 0.2; // 200ms
+                    source.connect(delayNode);
+                    delayNode.connect(audioCtxRef.current.destination);
+                    dafDelayNodeRef.current = { source, delayNode };
+                    setDafEnabled(true);
+                } else {
+                    // Disable
+                    if (dafDelayNodeRef.current) {
+                        dafDelayNodeRef.current.source.disconnect();
+                        dafDelayNodeRef.current.delayNode.disconnect();
+                    }
+                    setDafEnabled(false);
+                }
+            };
+
+            const toggleUltra = () => {
+                if (!isStreaming || !audioCtxRef.current) return;
+
+                if (!ultraEnabled) {
+                    const osc = audioCtxRef.current.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.value = 22000; // 22kHz Ultrasonic Fuzzing
+                    osc.connect(audioCtxRef.current.destination);
+                    osc.start();
+                    oscillatorRef.current = osc;
+                    setUltraEnabled(true);
+                } else {
+                    if (oscillatorRef.current) {
+                        oscillatorRef.current.stop();
+                        oscillatorRef.current.disconnect();
+                    }
+                    setUltraEnabled(false);
+                }
+            };
+
+            return (
+                <div className="container mx-auto px-4 py-8">
+                    <header className="flex justify-between items-center mb-10 border-b border-gray-800 pb-4">
+                        <div className="flex items-center space-x-3">
+                            <div className="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center brand">V</div>
+                            <h1 className="text-3xl font-bold tracking-wider pt-1 brand">VORTEX<span className="text-sm font-light text-indigo-400 ml-2">7-Layer Defense MVP</span></h1>
+                        </div>
+                        <div className="flex items-center space-x-4">
+                            {!isStreaming ? (
+                                <button onClick={startStream} className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2 px-6 rounded-lg transition duration-300">
+                                    INITIATE SURVEILLANCE
+                                </button>
+                            ) : (
+                                <button onClick={stopStream} className="bg-red-600 hover:bg-red-500 text-white font-bold py-2 px-6 rounded-lg transition duration-300 pulse-anim inline-block relative border border-red-400">
+                                    TERMINATE LINK
+                                </button>
+                            )}
+                        </div>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        
+                        {/* Status Module */}
+                        <div className="glass-panel p-6 col-span-1 flex flex-col justify-between">
+                            <div>
+                                <h2 className="text-xl font-bold mb-4 uppercase text-gray-400">Live Status</h2>
+                                <div className="flex items-center space-x-3 mb-6">
+                                    <div className={`w-4 h-4 rounded-full ${isStreaming ? 'bg-green-500 animate-ping' : 'bg-gray-600'}`}></div>
+                                    <span className="font-mono text-lg">{isStreaming ? 'LINK ACTIVE' : 'STANDBY'}</span>
+                                </div>
+                            </div>
+                            
+                            <div className="mt-8 border-t border-gray-700 pt-6">
+                                <h2 className="text-lg font-bold mb-4 uppercase text-gray-400">Active Probing (Layer 7)</h2>
+                                <p className="text-xs text-gray-500 mb-4 font-mono">Counter-measures directly target AI hidden states & bot behavioral anomalies.</p>
+                                
+                                <div className="space-y-4">
+                                    <button 
+                                        onClick={toggleDAF} 
+                                        disabled={!isStreaming}
+                                        className={`w-full py-3 px-4 rounded font-mono text-sm border transition ${dafEnabled ? 'bg-indigo-900 border-indigo-400 text-indigo-200' : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-gray-500'} ${!isStreaming && 'opacity-50 cursor-not-allowed'}`}>
+                                        [ {dafEnabled ? 'ACTIVE' : 'OFF'} ] Delayed Auditory Feedback (200ms)
+                                    </button>
+                                    <button 
+                                        onClick={toggleUltra} 
+                                        disabled={!isStreaming}
+                                        className={`w-full py-3 px-4 rounded font-mono text-sm border transition ${ultraEnabled ? 'bg-yellow-900 border-yellow-400 text-yellow-200' : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-gray-500'} ${!isStreaming && 'opacity-50 cursor-not-allowed'}`}>
+                                        [ {ultraEnabled ? 'INJECTING' : 'OFF'} ] Ultrasonic Fuzzing (&gt;20kHz)
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Analytic Modules */}
+                        <div className="col-span-1 lg:col-span-2 space-y-6">
+                            
+                            {/* Verdict Banner */}
+                            <div className="glass-panel p-8 text-center relative overflow-hidden flex items-center justify-center min-h-[160px]">
+                                {!telemetry ? (
+                                    <span className="text-gray-500 font-mono">Awaiting stream telemetry...</span>
+                                ) : (
+                                    <div className="relative z-10 w-full">
+                                        <div className="text-sm font-mono text-gray-400 mb-2">ACOUSTIC ENSEMBLE VERDICT</div>
+                                        {telemetry.verdict === 'FAKE' ? (
+                                            <h1 className="text-6xl font-black text-neon-red tracking-widest uppercase">{telemetry.verdict} DETECTED</h1>
+                                        ) : (
+                                            <h1 className="text-6xl font-black text-neon-green tracking-widest uppercase">{telemetry.verdict} HUMAN</h1>
+                                        )}
+                                        <div className="font-mono mt-4 text-gray-300">
+                                            Acoustic Anomaly Probability: <span className="text-white font-bold ml-2">{(telemetry.acoustic_fake_probability * 100).toFixed(2)}%</span>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* NLP Layer 5 */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div className="glass-panel p-6">
+                                    <h3 className="text-lg font-bold mb-4 uppercase text-gray-400">Live Transcription</h3>
+                                    <div className="bg-black bg-opacity-40 p-4 rounded h-40 overflow-y-auto border border-gray-800 font-mono text-sm leading-relaxed">
+                                        {telemetry && telemetry.transcript ? (
+                                            <span className="text-green-300">&gt; {telemetry.transcript}</span>
+                                        ) : (
+                                            <span className="text-gray-600 italic">Listening...</span>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="glass-panel p-6">
+                                    <h3 className="text-lg font-bold mb-4 uppercase text-gray-400">Layer 5: Intent Recognition</h3>
+                                    
+                                    {!telemetry ? (
+                                        <div className="text-gray-600 italic font-mono text-sm">Awaiting text for NLI zero-shot...</div>
+                                    ) : (
+                                        <div className="space-y-4">
+                                            <div className="flex justify-between items-center mb-1">
+                                                <span className="font-mono text-xs uppercase text-red-300">Urgency</span>
+                                                <span className="font-mono text-xs text-gray-300">{(telemetry.intent_breakdown['urgency'] * 100).toFixed(1)}%</span>
+                                            </div>
+                                            <div className="w-full bg-gray-800 rounded-full h-2 rounded overflow-hidden">
+                                                <div className="bg-red-500 h-2 rounded-full" style={{width: `${telemetry.intent_breakdown['urgency'] * 100}%`}}></div>
+                                            </div>
+
+                                            <div className="flex justify-between items-center mb-1 mt-3">
+                                                <span className="font-mono text-xs uppercase text-yellow-300">Authority Impersonation</span>
+                                                <span className="font-mono text-xs text-gray-300">{(telemetry.intent_breakdown['authority impersonation'] * 100).toFixed(1)}%</span>
+                                            </div>
+                                            <div className="w-full bg-gray-800 rounded-full h-2 rounded overflow-hidden">
+                                                <div className="bg-yellow-500 h-2 rounded-full" style={{width: `${telemetry.intent_breakdown['authority impersonation'] * 100}%`}}></div>
+                                            </div>
+
+                                            <div className="flex justify-between items-center mb-1 mt-3">
+                                                <span className="font-mono text-xs uppercase text-blue-300">Financial Demand</span>
+                                                <span className="font-mono text-xs text-gray-300">{(telemetry.intent_breakdown['financial demand'] * 100).toFixed(1)}%</span>
+                                            </div>
+                                            <div className="w-full bg-gray-800 rounded-full h-2 rounded overflow-hidden">
+                                                <div className="bg-blue-500 h-2 rounded-full" style={{width: `${telemetry.intent_breakdown['financial demand'] * 100}%`}}></div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
